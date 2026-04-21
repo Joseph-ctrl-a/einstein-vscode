@@ -1,0 +1,10 @@
+generate-icon.js
+.vscode/**
+.vscode-test/**
+src/**
+.gitignore
+tsconfig.json
+**/*.map
+**/*.ts
+!out/**
+node_modules/**

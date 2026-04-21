@@ -1,0 +1,64 @@
+{
+  "name": "einstein-vscode",
+  "displayName": "Einstein",
+  "description": "Submit and test DCU assignments via Einstein",
+  "version": "0.1.0",
+  "publisher": "JosephOgbomo",
+  "icon": "icon.png",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": [
+    "onTerminalProfile:einstein.terminal"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "einstein.openTerminal",
+        "title": "Einstein: Open Terminal"
+      },
+      {
+        "command": "einstein.setCredentials",
+        "title": "Einstein: Set Credentials"
+      },
+      {
+        "command": "einstein.clearCredentials",
+        "title": "Einstein: Clear Credentials"
+      }
+    ],
+    "terminal": {
+      "profiles": [
+        {
+          "id": "einstein.terminal",
+          "title": "Einstein",
+          "icon": "zap"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Einstein",
+      "properties": {
+        "einstein.defaultModule": {
+          "type": "string",
+          "default": "",
+          "description": "Your module code (e.g. ca116, csc1035). Set automatically on first use."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.3.0",
+    "@vscode/vsce": "^2.22.0"
+  }
+}
