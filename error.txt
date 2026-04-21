@@ -1,0 +1,7 @@
+PS C:\Users\Flaun\Desktop\einstein_extension> git branch -M main
+PS C:\Users\Flaun\Desktop\einstein_extension> git remote add origin https://github.com/Joseph-ctrl-a/einstein-vscode.git
+
+PS C:\Users\Flaun\Desktop\einstein_extension> git push origin -u origin main
+error: src refspec origin does not match any
+error: failed to push some refs to 'https://github.com/Joseph-ctrl-a/einstein-vscode.git'
+PS C:\Users\Flaun\Desktop\einstein_extension> 
