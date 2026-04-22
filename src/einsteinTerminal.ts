@@ -1,5 +1,6 @@
 import * as vscode from 'vscode'
 import * as path from 'path'
+import * as fs from 'fs'
 import { CredentialManager } from './credentialManager'
 import {
   checkAuth,
@@ -7,6 +8,8 @@ import {
   AuthError,
   NetworkError,
 } from './einsteinClient'
+
+// ─── ANSI colour tokens ───────────────────────────────────────────────────────
 
 const C = {
   reset: '\x1b[0m',
@@ -20,16 +23,123 @@ const C = {
   white: '\x1b[97m',
 }
 
+// ─── Str — pure string utilities ─────────────────────────────────────────────
+
+const Str = {
+  longestCommonPrefix: (strs: string[]): string =>
+    strs.reduce((prefix, str) => {
+      while (!str.startsWith(prefix)) prefix = prefix.slice(0, -1)
+      return prefix
+    }, strs[0] ?? ''),
+
+  errorMessage: (e: unknown): string =>
+    e instanceof Error ? e.message : String(e),
+}
+
+// ─── Format — pure display utilities ─────────────────────────────────────────
+
+const Format = {
+  uniqueBasenames: (uris: vscode.Uri[]): string[] =>
+    [...new Set(uris.map(f => path.basename(f.fsPath)))].sort(),
+
+  // Split names into rows, pad each name to column width, join into a single string per row
+  columns: (names: string[], termWidth = 80): string[] => {
+    const col = Math.max(...names.map(n => n.length)) + 2
+    const perRow = Math.max(1, Math.floor(termWidth / col))
+    const rowCount = Math.ceil(names.length / perRow)
+    return Array.from({ length: rowCount }, (_, i) =>
+      names
+        .slice(i * perRow, (i + 1) * perRow)
+        .map(n => n.padEnd(col))
+        .join(''),
+    )
+  },
+
+  testResult: (
+    t: { name: string; passed: boolean },
+    nameWidth: number,
+  ): string => {
+    const padded = t.name.padEnd(nameWidth)
+    return t.passed
+      ? `  ${C.green}✓${C.reset}  ${padded}  ${C.green}passed${C.reset}`
+      : `  ${C.red}✗${C.reset}  ${padded}  ${C.red}failed${C.reset}`
+  },
+
+  summary: (passCount: number, failCount: number, total: number): string =>
+    failCount === 0
+      ? `${C.bold}${C.green}All ${total} tests passed ✓${C.reset}`
+      : `${C.bold}${passCount}/${total} tests passed${C.reset}  ${C.dim}(${failCount} failed)${C.reset}`,
+}
+
+// ─── FileSystem — workspace-aware file utilities ──────────────────────────────
+
+const FileSystem = {
+  hasWorkspace: (): boolean =>
+    (vscode.workspace.workspaceFolders?.length ?? 0) > 0,
+
+  // Returns the directory of the currently open file, if any
+  activeEditorDir: (): string | undefined => {
+    const editor = vscode.window.activeTextEditor
+    return editor?.document.uri.scheme === 'file'
+      ? path.dirname(editor.document.uri.fsPath)
+      : undefined
+  },
+
+  activeEditorPath: (): string | undefined => {
+    const editor = vscode.window.activeTextEditor
+    return editor?.document.uri.scheme === 'file'
+      ? editor.document.uri.fsPath
+      : undefined
+  },
+
+  // Workspace-aware findFiles — falls back to scanning the active editor's
+  // directory when no folder is open, so the tool works with lone open files
+  findFiles: async (pattern: string, limit = 50): Promise<vscode.Uri[]> => {
+    if (FileSystem.hasWorkspace()) {
+      return vscode.workspace.findFiles(pattern, '**/node_modules/**', limit)
+    }
+
+    const dir = FileSystem.activeEditorDir()
+    if (!dir) return []
+
+    // Strip glob syntax to get the bare prefix we're matching against
+    const prefix = pattern.replace(/\*\*\//g, '').replace(/\*/g, '')
+
+    try {
+      return fs
+        .readdirSync(dir)
+        .filter(f => f.startsWith(prefix))
+        .map(f => vscode.Uri.file(path.join(dir, f)))
+    } catch {
+      return []
+    }
+  },
+
+  // Where to persist config — workspace if one is open, otherwise global
+  configTarget: (): vscode.ConfigurationTarget =>
+    FileSystem.hasWorkspace()
+      ? vscode.ConfigurationTarget.Workspace
+      : vscode.ConfigurationTarget.Global,
+}
+
+// ─── PTY class ────────────────────────────────────────────────────────────────
+
+type KeyHandler = () => void
+
 export class EinsteinPty implements vscode.Pseudoterminal {
   private writeEmitter = new vscode.EventEmitter<string>()
   onDidWrite = this.writeEmitter.event
+
   private inputs: string[] = []
   private historyIndex = 0
   private line = ''
   private busy = false
-  private lastTabPartial = '' // tracks what was typed when Tab was last pressed
+  private lastTabPartial = ''
+  private cursorPos = 0
 
   constructor(private readonly credentials: CredentialManager) {}
+
+  // ─── Lifecycle ──────────────────────────────────────────────────────────────
 
   open(): void {
     this.printBanner()
@@ -38,13 +148,88 @@ export class EinsteinPty implements vscode.Pseudoterminal {
 
   close(): void {}
 
+  // ─── Input handling ─────────────────────────────────────────────────────────
+
+  private readonly keyHandlers = new Map<string, KeyHandler>([
+    [
+      '\r',
+      () => {
+        this.write('\r\n')
+        const cmd = this.line.trim()
+        this.line = ''
+        this.cursorPos = 0
+        if (cmd) {
+          this.inputs = [...this.inputs.slice(-499), cmd]
+          this.historyIndex = 0
+          this.run(cmd)
+        } else {
+          this.prompt()
+        }
+      },
+    ],
+    [
+      '\x03',
+      () => {
+        this.line = ''
+        this.cursorPos = 0
+        this.write('^C\r\n')
+        this.prompt()
+      },
+    ],
+    [
+      '\x7f',
+      () => {
+        if (this.cursorPos > 0) {
+          this.line =
+            this.line.slice(0, this.cursorPos - 1) +
+            this.line.slice(this.cursorPos)
+          this.cursorPos--
+          const tail = this.line.slice(this.cursorPos)
+          this.write('\b' + tail + ' ' + '\x1b[D'.repeat(tail.length + 1))
+        }
+      },
+    ],
+    [
+      '\x1b[A',
+      () => {
+        this.historyIndex = Math.min(this.historyIndex + 1, this.inputs.length)
+        this.replaceLine(this.inputs.at(-this.historyIndex) ?? this.line)
+      },
+    ],
+    [
+      '\x1b[B',
+      () => {
+        const cmd =
+          this.historyIndex <= 0
+            ? this.line
+            : this.inputs.at(-this.historyIndex--)
+        this.replaceLine(cmd ?? this.line)
+      },
+    ],
+    [
+      '\x1b[D',
+      () => {
+        if (this.cursorPos > 0) {
+          this.cursorPos--
+          this.write('\x1b[D')
+        }
+      },
+    ],
+    [
+      '\x1b[C',
+      () => {
+        if (this.cursorPos < this.line.length) {
+          this.cursorPos++
+          this.write('\x1b[C')
+        }
+      },
+    ],
+  ])
+
   handleInput(data: string): void {
-    if (this.busy) {
-      return
-    }
+    if (this.busy) return
 
     if (data === '\t') {
-      // Reset last tab partial on any non-tab keypress (handled below for others)
       this.busy = true
       this.handleTab().finally(() => {
         this.busy = false
@@ -52,127 +237,102 @@ export class EinsteinPty implements vscode.Pseudoterminal {
       return
     }
 
-    // Any key other than Tab resets the double-tab state
     this.lastTabPartial = ''
 
-    if (data === '\r') {
-      this.write('\r\n')
-      const cmd = this.line.trim()
-      this.line = ''
-      if (cmd) {
-        this.inputs.push(cmd)
-        if (this.inputs.length >= 500) {
-          this.inputs.shift()
-        }
-        this.historyIndex = 0
-        this.run(cmd)
-      } else {
-        this.prompt()
-      }
-    } else if (data === '\x7f') {
-      // Backspace
-      if (this.line.length > 0) {
-        this.line = this.line.slice(0, -1)
-        this.write('\b \b')
-      }
-    } else if (data === '\x03') {
-      // Ctrl+C
-      this.line = ''
-      this.write('^C\r\n')
-      this.prompt()
+    const handler = this.keyHandlers.get(data)
+    if (handler) {
+      handler()
     } else if (data >= ' ') {
-      // Printable character — echo and append
-      this.line += data
-      this.write(data)
-    } else if (data === '\x1b[A') {
-      this.historyIndex++
-      this.historyIndex = Math.min(this.historyIndex, this.inputs.length)
-      this.write('\b \b'.repeat(this.line.length))
-      this.line = this.inputs.at(-this.historyIndex) ?? this.line
-      this.write(this.line)
+      this.line =
+        this.line.slice(0, this.cursorPos) +
+        data +
+        this.line.slice(this.cursorPos)
+      this.cursorPos++
+      const tail = this.line.slice(this.cursorPos)
+      this.write(data + tail + '\x1b[D'.repeat(tail.length))
     }
   }
 
+  // ─── Tab completion ──────────────────────────────────────────────────────────
+
   private async handleTab(): Promise<void> {
     const parts = this.line.trimStart().split(/\s+/)
-    // Only complete when the user is typing a filename argument
-    const isEinsteinCmd =
-      parts[0]?.toLowerCase() === 'einstein' && parts.length >= 2
-    const isBlankArg =
-      parts[0]?.toLowerCase() === 'einstein' && parts.length === 1
-
-    if (isBlankArg) {
-      // `einstein [TAB]` — show all submittable files
-      const files = await vscode.workspace.findFiles(
-        '**/*.{py,c,h,java,js,ts,cpp,cs,rb,sh}',
-        '**/node_modules/**',
-        50,
-      )
-      if (files.length === 0) {
-        this.write('\x07')
-        return
-      }
-      const names = [...new Set(files.map(f => path.basename(f.fsPath)))].sort()
-      this.write('\r\n')
-      this.writeColumns(names)
-      this.reprompWithLine()
+    if (parts[0]?.toLowerCase() !== 'einstein') {
+      this.write('\x07')
       return
     }
+    parts.length === 1
+      ? await this.tabShowAll()
+      : await this.tabComplete(parts[parts.length - 1])
+  }
 
-    if (!isEinsteinCmd) {
-      this.write('\x07') // bell — nothing to complete
-      return
-    }
-
-    const partial = parts[parts.length - 1]
-
-    const files = await vscode.workspace.findFiles(
-      `**/${partial}*`,
-      '**/node_modules/**',
-      50,
+  private async tabShowAll(): Promise<void> {
+    const files = await FileSystem.findFiles(
+      '**/*.{py,c,h,java,js,ts,cpp,cs,rb,sh}',
     )
-
     if (files.length === 0) {
-      this.write('\x07') // bell — no matches
+      this.write('\x07')
+      return
+    }
+    this.write('\r\n')
+    Format.columns(Format.uniqueBasenames(files)).forEach(row =>
+      this.writeLine(row),
+    )
+    this.reprompWithLine()
+  }
+
+  private async tabComplete(partial: string): Promise<void> {
+    const files = await FileSystem.findFiles(`**/${partial}*`)
+    if (files.length === 0) {
+      this.write('\x07')
       return
     }
 
-    const names = [...new Set(files.map(f => path.basename(f.fsPath)))].sort()
+    const names = Format.uniqueBasenames(files)
 
     if (names.length === 1) {
-      // Unique match — complete fully
       const completion = names[0].slice(partial.length)
       this.line += completion
+      this.cursorPos += completion.length
       this.write(completion)
       this.lastTabPartial = ''
       return
     }
 
-    const lcp = longestCommonPrefix(names)
+    const lcp = Str.longestCommonPrefix(names)
 
     if (lcp.length > partial.length) {
-      // Can extend to the shared prefix
       const completion = lcp.slice(partial.length)
       this.line += completion
+      this.cursorPos += completion.length
       this.write(completion)
       this.lastTabPartial = lcp
       return
     }
 
-    // Already at longest common prefix — show all options (bash-style)
-    // If the user presses Tab again on the same partial, show immediately;
-    // first Tab just rings the bell as a hint there are multiple options.
     if (this.lastTabPartial !== partial) {
       this.lastTabPartial = partial
-      this.write('\x07') // bell on first Tab
+      this.write('\x07')
       return
     }
 
-    // Second Tab on same partial — list all matches
     this.write('\r\n')
-    this.writeColumns(names)
+    Format.columns(names).forEach(row => this.writeLine(row))
     this.reprompWithLine()
   }
+
+  // ─── Command dispatch ────────────────────────────────────────────────────────
+
+  private readonly commands = new Map<
+    string,
+    (args: string[]) => Promise<void>
+  >([
+    ['einstein', args => this.handleSubmit(args.join(' ').trim())],
+    ['help', () => Promise.resolve(this.printHelp())],
+    ['clear', () => Promise.resolve(this.write('\x1b[2J\x1b[H'))],
+    ['set module', args => this.handleSetModule(args.join(' ').trim())],
+    ['set credentials', () => this.handleSetCredentials()],
+  ])
 
   private async run(cmd: string): Promise<void> {
     this.busy = true
@@ -180,9 +340,7 @@ export class EinsteinPty implements vscode.Pseudoterminal {
       await this.dispatch(cmd)
     } catch (e) {
       this.writeLine(
-        `${C.red}Unexpected error: ${
-          e instanceof Error ? e.message : String(e)
-        }${C.reset}`,
+        `${C.red}Unexpected error: ${Str.errorMessage(e)}${C.reset}`,
       )
     } finally {
       this.busy = false
@@ -193,17 +351,15 @@ export class EinsteinPty implements vscode.Pseudoterminal {
   private async dispatch(cmd: string): Promise<void> {
     const parts = cmd.trim().split(/\s+/)
     const verb = parts[0].toLowerCase()
+    const twoWord =
+      parts.length >= 2 ? `${verb} ${parts[1].toLowerCase()}` : null
 
-    if (verb === 'einstein') {
-      await this.handleSubmit(parts.slice(1).join(' ').trim())
-    } else if (verb === 'help') {
-      this.printHelp()
-    } else if (verb === 'clear') {
-      this.write('\x1b[2J\x1b[H')
-    } else if (verb === 'set' && parts[1]?.toLowerCase() === 'module') {
-      await this.handleSetModule(parts.slice(2).join('').trim())
-    } else if (verb === 'set' && parts[1]?.toLowerCase() === 'credentials') {
-      await this.handleSetCredentials()
+    const isSub = twoWord !== null && this.commands.has(twoWord)
+    const key = isSub ? twoWord! : verb
+    const handler = this.commands.get(key)
+
+    if (handler) {
+      await handler(parts.slice(isSub ? 2 : 1))
     } else {
       this.writeLine(
         `${C.yellow}Unknown command "${verb}". Type ${C.bold}help${C.reset}${C.yellow} for usage.${C.reset}`,
@@ -211,27 +367,19 @@ export class EinsteinPty implements vscode.Pseudoterminal {
     }
   }
 
+  // ─── Command handlers ────────────────────────────────────────────────────────
+
   private async handleSubmit(filename: string): Promise<void> {
-    // Resolve which file to submit
     const filePath = await this.resolveFile(filename)
-    if (!filePath) {
-      return
-    }
+    if (!filePath) return
 
-    // Resolve module code
     const module = await this.resolveModule()
-    if (!module) {
-      return
-    }
+    if (!module) return
 
-    // Resolve credentials
     const creds = await this.resolveCredentials()
-    if (!creds) {
-      return
-    }
+    if (!creds) return
 
     const fileName = path.basename(filePath)
-
     this.write('\r\n')
     this.writeLine(`${C.dim}${'─'.repeat(48)}${C.reset}`)
     this.writeLine(
@@ -250,46 +398,27 @@ export class EinsteinPty implements vscode.Pseudoterminal {
         creds.username,
         creds.password,
       )
+      const { testResults, passCount, failCount, reportUrl } = result
 
       this.write('\r\n')
 
-      const { testResults, passCount, failCount, reportUrl } = result
-      const total = testResults.length
-
-      if (total === 0) {
+      if (testResults.length === 0) {
         this.writeLine(
           `${C.yellow}No test results found in server response.${C.reset}`,
         )
         this.write('\r\n')
         this.writeLine(`${C.dim}Raw output:${C.reset}`)
-        for (const line of result.rawOutput.split('\n').slice(0, 20)) {
-          this.writeLine(`  ${C.dim}${line}${C.reset}`)
-        }
+        result.rawOutput
+          .split('\n')
+          .slice(0, 20)
+          .forEach(l => this.writeLine(`  ${C.dim}${l}${C.reset}`))
       } else {
         const nameWidth = Math.max(...testResults.map(t => t.name.length), 24)
-        for (const t of testResults) {
-          const padded = t.name.padEnd(nameWidth)
-          if (t.passed) {
-            this.writeLine(
-              `  ${C.green}✓${C.reset}  ${padded}  ${C.green}passed${C.reset}`,
-            )
-          } else {
-            this.writeLine(
-              `  ${C.red}✗${C.reset}  ${padded}  ${C.red}failed${C.reset}`,
-            )
-          }
-        }
-
+        testResults
+          .map(t => Format.testResult(t, nameWidth))
+          .forEach(l => this.writeLine(l))
         this.write('\r\n')
-        if (failCount === 0) {
-          this.writeLine(
-            `${C.bold}${C.green}All ${total} tests passed ✓${C.reset}`,
-          )
-        } else {
-          this.writeLine(
-            `${C.bold}${passCount}/${total} tests passed${C.reset}  ${C.dim}(${failCount} failed)${C.reset}`,
-          )
-        }
+        this.writeLine(Format.summary(passCount, failCount, testResults.length))
       }
 
       this.write('\r\n')
@@ -302,35 +431,37 @@ export class EinsteinPty implements vscode.Pseudoterminal {
         )
       } else if (e instanceof NetworkError) {
         this.writeLine(
-          `${C.red}Network error: ${(e as Error).message}${C.reset}`,
+          `${C.red}Network error: ${Str.errorMessage(e)}${C.reset}`,
         )
       } else {
-        this.writeLine(
-          `${C.red}Error: ${e instanceof Error ? e.message : String(e)}${
-            C.reset
-          }`,
-        )
+        this.writeLine(`${C.red}Error: ${Str.errorMessage(e)}${C.reset}`)
       }
     }
   }
 
   private async resolveFile(filename: string): Promise<string | undefined> {
     if (!filename) {
-      // No filename given — try the active editor
-      const editor = vscode.window.activeTextEditor
-      if (editor && editor.document.uri.scheme === 'file') {
-        return editor.document.uri.fsPath
-      }
+      const filePath = FileSystem.activeEditorPath()
+      if (filePath) return filePath
       this.writeLine(`${C.yellow}Usage: ${C.bold}einstein <filename>${C.reset}`)
       return undefined
     }
 
-    // If absolute path, use directly
-    if (path.isAbsolute(filename)) {
-      return filename
+    if (path.isAbsolute(filename)) return filename
+
+    // Try the active editor's directory first (works with no workspace open)
+    const dir = FileSystem.activeEditorDir()
+    if (dir) {
+      const candidate = path.join(dir, filename)
+      if (fs.existsSync(candidate)) return candidate
     }
 
-    // Search workspace for the file
+    // Fall back to workspace search
+    if (!FileSystem.hasWorkspace()) {
+      this.writeLine(`${C.red}File not found: ${filename}${C.reset}`)
+      return undefined
+    }
+
     const matches = await vscode.workspace.findFiles(
       `**/${filename}`,
       '**/node_modules/**',
@@ -342,11 +473,8 @@ export class EinsteinPty implements vscode.Pseudoterminal {
       return undefined
     }
 
-    if (matches.length === 1) {
-      return matches[0].fsPath
-    }
+    if (matches.length === 1) return matches[0].fsPath
 
-    // Multiple matches — let user pick via QuickPick
     const items = matches.map(u => ({
       label: path.basename(u.fsPath),
       description: vscode.workspace.asRelativePath(u.fsPath),
@@ -364,11 +492,8 @@ export class EinsteinPty implements vscode.Pseudoterminal {
   private async resolveModule(): Promise<string | undefined> {
     const config = vscode.workspace.getConfiguration('einstein')
     const saved: string = config.get('defaultModule', '')
-    if (saved.trim()) {
-      return saved.trim().toLowerCase()
-    }
+    if (saved.trim()) return saved.trim().toLowerCase()
 
-    // Ask via QuickPick so it floats above the terminal nicely
     const input = await vscode.window.showInputBox({
       title: 'Einstein — Module Code',
       prompt: 'Enter your module code (e.g. ca116, csc1035)',
@@ -377,24 +502,13 @@ export class EinsteinPty implements vscode.Pseudoterminal {
         v.trim() ? undefined : 'Module code cannot be empty',
     })
 
-    if (!input?.trim()) {
-      return undefined
-    }
+    if (!input?.trim()) return undefined
+
     const module = input.trim().toLowerCase()
-
-    await config.update(
-      'defaultModule',
-      module,
-      vscode.ConfigurationTarget.Workspace,
-    )
+    await config.update('defaultModule', module, FileSystem.configTarget())
     this.writeLine(
-      `${
-        C.dim
-      }Module set to ${module.toUpperCase()} (saved for this workspace)${
-        C.reset
-      }`,
+      `${C.dim}Module set to ${module.toUpperCase()} (saved)${C.reset}`,
     )
-
     return module
   }
 
@@ -402,9 +516,7 @@ export class EinsteinPty implements vscode.Pseudoterminal {
     { username: string; password: string } | undefined
   > {
     const existing = await this.credentials.get()
-    if (existing) {
-      return existing
-    }
+    if (existing) return existing
 
     this.writeLine(`${C.yellow}No credentials saved. Opening prompt…${C.reset}`)
     const creds = await this.credentials.promptAndStore()
@@ -423,26 +535,18 @@ export class EinsteinPty implements vscode.Pseudoterminal {
         prompt: 'Enter your module code (e.g. ca116, csc1035)',
         ignoreFocusOut: true,
       })
-      if (!input?.trim()) {
-        return
-      }
+      if (!input?.trim()) return
       code = input.trim().toLowerCase()
     }
     const config = vscode.workspace.getConfiguration('einstein')
-    await config.update(
-      'defaultModule',
-      code,
-      vscode.ConfigurationTarget.Workspace,
-    )
+    await config.update('defaultModule', code, FileSystem.configTarget())
     this.writeLine(`${C.green}Module set to ${code.toUpperCase()}${C.reset}`)
   }
 
   private async handleSetCredentials(): Promise<void> {
     this.writeLine(`${C.dim}Opening credential prompt…${C.reset}`)
     const creds = await this.credentials.promptAndStore()
-    if (!creds) {
-      return
-    }
+    if (!creds) return
 
     this.writeLine(`${C.dim}Verifying…${C.reset}`)
     try {
@@ -455,8 +559,19 @@ export class EinsteinPty implements vscode.Pseudoterminal {
     }
   }
 
+  // ─── Rendering helpers ───────────────────────────────────────────────────────
+
+  private replaceLine(text: string): void {
+    // Move to end of line before erasing, since cursor may be mid-line
+    this.write('\x1b[C'.repeat(this.line.length - this.cursorPos))
+    this.write('\b \b'.repeat(this.line.length))
+    this.line = text
+    this.cursorPos = text.length
+    this.write(this.line)
+  }
+
   private printBanner(): void {
-    this.write('\x1b[2J\x1b[H') // clear screen
+    this.write('\x1b[2J\x1b[H')
     this.writeLine(
       `${C.bold}${C.cyan}⚡ Einstein${C.reset}  ${C.dim}DCU Assignment Submission Tool${C.reset}`,
     )
@@ -467,45 +582,21 @@ export class EinsteinPty implements vscode.Pseudoterminal {
   }
 
   private printHelp(): void {
-    this.write('\r\n')
-    this.writeLine(`${C.bold}Usage:${C.reset}`)
-    this.writeLine(
+    ;[
+      '',
+      `${C.bold}Usage:${C.reset}`,
       `  ${C.cyan}einstein <file>${C.reset}          Submit a file  ${C.dim}(e.g. einstein task1.py)${C.reset}`,
-    )
-    this.writeLine(
       `  ${C.cyan}einstein${C.reset}                 Submit the currently open file`,
-    )
-    this.writeLine(
       `  ${C.cyan}set module <code>${C.reset}        Set your module  ${C.dim}(e.g. set module ca116)${C.reset}`,
-    )
-    this.writeLine(
       `  ${C.cyan}set credentials${C.reset}          Update your DCU username/password`,
-    )
-    this.writeLine(
       `  ${C.cyan}clear${C.reset}                    Clear the terminal`,
-    )
-    this.writeLine(
       `  ${C.cyan}help${C.reset}                     Show this message`,
-    )
-    this.write('\r\n')
+      '',
+    ].forEach(l => this.writeLine(l))
   }
 
   private reprompWithLine(): void {
     this.write(`${C.bold}${C.cyan}einstein>${C.reset} ${this.line}`)
-  }
-
-  private writeColumns(names: string[]): void {
-    const col = Math.max(...names.map(n => n.length)) + 2
-    const termWidth = 80
-    const perRow = Math.max(1, Math.floor(termWidth / col))
-    for (let i = 0; i < names.length; i += perRow) {
-      const row = names
-        .slice(i, i + perRow)
-        .map(n => n.padEnd(col))
-        .join('')
-      this.writeLine(row)
-    }
-    this.write('\r\n')
   }
 
   private prompt(): void {
@@ -519,20 +610,4 @@ export class EinsteinPty implements vscode.Pseudoterminal {
   private write(text: string): void {
     this.writeEmitter.fire(text)
   }
-}
-
-function longestCommonPrefix(strs: string[]): string {
-  if (strs.length === 0) {
-    return ''
-  }
-  let prefix = strs[0]
-  for (let i = 1; i < strs.length; i++) {
-    while (!strs[i].startsWith(prefix)) {
-      prefix = prefix.slice(0, -1)
-      if (!prefix) {
-        return ''
-      }
-    }
-  }
-  return prefix
 }
