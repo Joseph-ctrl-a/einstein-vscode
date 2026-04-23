@@ -2,7 +2,7 @@
   "name": "einstein-vscode",
   "displayName": "Einstein",
   "description": "Submit and test DCU assignments via Einstein",
-  "version": "0.1.0",
+  "version": "0.1.3",
   "publisher": "JosephOgbomo",
   "icon": "icon.png",
   "license": "MIT",
@@ -13,7 +13,9 @@
   "engines": {
     "vscode": "^1.85.0"
   },
-  "categories": ["Other"],
+  "categories": [
+    "Other"
+  ],
   "activationEvents": [
     "onTerminalProfile:einstein.terminal"
   ],

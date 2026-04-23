@@ -1,3 +1,4 @@
 {
-  "einstein.defaultModule": "csc1035"
+  "einstein.defaultModule": "csc1035",
+  "prettier.enable": false
 }
